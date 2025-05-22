@@ -55,7 +55,6 @@ func main() {
 }
 
 func validateChirp(w http.ResponseWriter, req *http.Request) {
-	w.Header().Add("Content-Type", "application/JSON")
 	decoder := json.NewDecoder(req.Body)
 	defer req.Body.Close()
 	reqbody := struct {
@@ -63,32 +62,22 @@ func validateChirp(w http.ResponseWriter, req *http.Request) {
 	}{}
 	err := decoder.Decode(&reqbody)
 	if err != nil {
-		unknownerror(w)
+		responseunknownerror(w)
 		return
 	}
 	if len(reqbody.Body) > 140 {
-		w.WriteHeader(400)
-		errmessage := struct {
-			Error string `json:"error"`
-		}{Error: "Chirp is too long"}
-		message, err := json.Marshal(errmessage)
-		if err != nil {
-			unknownerror(w)
-			return
-		}
-		w.Write(message)
+		responsewitherror(w, 400, "Chirp is too long")
 		return
 	} else {
 		cleantext := profanitycheck(reqbody.Body)
-		w.WriteHeader(200)
 		resmessage, err := json.Marshal(struct {
 			Cleanedbody string `json:"cleaned_body"`
 		}{Cleanedbody: cleantext})
 		if err != nil {
-			unknownerror(w)
+			responseunknownerror(w)
 			return
 		}
-		w.Write(resmessage)
+		responsewithjson(w, resmessage)
 		return
 	}
 }
@@ -107,14 +96,26 @@ func profanitycheck(s string) string {
 	return strings.Join(splitted, " ")
 }
 
-func unknownerror(w http.ResponseWriter) {
+func responseunknownerror(w http.ResponseWriter) {
 	message, _ := json.Marshal(struct {
 		Error string `json:"error"`
 	}{Error: "Something went wrong"})
 	w.WriteHeader(500)
 	w.Write(message)
-	return
+}
 
+func responsewitherror(w http.ResponseWriter, code int, message string) {
+	w.Header().Add("Content-Type", "application/json")
+	error, _ := json.Marshal(struct {
+		Error string `json:"error"`
+	}{Error: message})
+	w.WriteHeader(code)
+	w.Write(error)
+}
+
+func responsewithjson(w http.ResponseWriter, data []byte) {
+	w.Header().Add("Content-Type", "application/json")
+	w.Write(data)
 }
 
 func Readiness(w http.ResponseWriter, req *http.Request) {
