@@ -3,10 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	_ "github.com/lib/pq"
 	"log"
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 type apiConfig struct {
@@ -50,8 +52,24 @@ func main() {
 		Addr:    ":" + port,
 		Handler: mux,
 	}
-
+	go nicemessage()
 	log.Fatal(server.ListenAndServe())
+}
+
+func nicemessage() {
+	dotcount := 3
+	dot := "."
+	message := "Server listening"
+	for {
+		fmt.Print("\033[H\033[2J")
+		fmt.Printf("%s%s", message, dot)
+		if len(dot) == dotcount {
+			dot = "."
+		} else {
+			dot = dot + "."
+		}
+		time.Sleep(time.Millisecond * 500)
+	}
 }
 
 func validateChirp(w http.ResponseWriter, req *http.Request) {
