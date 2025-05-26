@@ -1,11 +1,17 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	auth "github.com/Cacutss/Chirpy/internal/auth"
+	database "github.com/Cacutss/Chirpy/internal/database"
+	"github.com/google/uuid"
+	godotenv "github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -13,6 +19,63 @@ import (
 
 type apiConfig struct {
 	fileserverhits atomic.Int32
+	db             *database.Queries
+	platform       string
+}
+
+type ParseUser struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+	Password  string    `json:"password"`
+}
+
+type ReturnUser struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
+
+type Chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserId    uuid.UUID `json:"user_id"`
+}
+
+func main() {
+	apiconf := &apiConfig{}
+	godotenv.Load(".env")
+	dbUrl := os.Getenv("DB_URL")
+	apiconf.platform = os.Getenv("PLATFORM")
+	db, err := sql.Open("postgres", dbUrl)
+	if err != nil {
+		log.Printf("%v", err)
+	}
+	apiconf.db = database.New(db)
+	const (
+		Rootpath = "."
+		port     = "8080"
+	)
+	mux := http.NewServeMux()
+	mux.Handle("/app/", apiconf.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(Rootpath)))))
+	mux.HandleFunc("GET /api/healthz", Readiness)
+	mux.HandleFunc("GET /admin/metrics", apiconf.Counter)
+	mux.HandleFunc("POST /admin/reset", apiconf.Reset)
+	mux.HandleFunc("POST /api/users", apiconf.createUser)
+	mux.HandleFunc("POST /api/login", apiconf.login)
+	mux.HandleFunc("POST /api/chirps", apiconf.validateChirp)
+	mux.HandleFunc("GET /api/chirps", apiconf.getchirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiconf.getchirp)
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
+	go nicemessage()
+	log.Fatal(server.ListenAndServe())
 }
 
 func (c *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -32,28 +95,173 @@ func (c *apiConfig) Counter(w http.ResponseWriter, req *http.Request) {
 
 func (c *apiConfig) Reset(w http.ResponseWriter, req *http.Request) {
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
+	if c.platform != "dev" {
+		w.WriteHeader(403)
+		return
+	}
 	w.WriteHeader(200)
+	c.db.ResetUsers(req.Context())
+	w.Write([]byte("Users table resetted successfully"))
 	c.fileserverhits.Store(0)
 }
 
-func main() {
-	const (
-		Rootpath = "."
-		port     = "8080"
-	)
-	apiconf := &apiConfig{}
-	mux := http.NewServeMux()
-	mux.Handle("/app/", apiconf.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(Rootpath)))))
-	mux.HandleFunc("GET /api/healthz", Readiness)
-	mux.HandleFunc("GET /admin/metrics", apiconf.Counter)
-	mux.HandleFunc("POST /admin/reset", apiconf.Reset)
-	mux.HandleFunc("POST /api/validate_chirp", validateChirp)
-	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: mux,
+func (c *apiConfig) createUser(w http.ResponseWriter, req *http.Request) {
+	decoder := json.NewDecoder(req.Body)
+	defer req.Body.Close()
+	var user ParseUser
+	err := decoder.Decode(&user)
+	if err != nil {
+		responseunknownerror(w)
+		return
 	}
-	go nicemessage()
-	log.Fatal(server.ListenAndServe())
+	hashedpassw, err := auth.HashPassword(user.Password)
+	params := database.CreateUserParams{
+		Email:          user.Email,
+		HashedPassword: hashedpassw,
+	}
+	u, err := c.db.CreateUser(req.Context(), params)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	w.WriteHeader(201)
+	returnvalue := ReturnUser{
+		ID:        u.ID,
+		CreatedAt: u.CreatedAt,
+		UpdatedAt: u.UpdatedAt,
+		Email:     u.Email,
+	}
+	data, err := json.Marshal(returnvalue)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	responsewithjson(w, data)
+	return
+}
+
+func (c *apiConfig) validateChirp(w http.ResponseWriter, req *http.Request) {
+	decoder := json.NewDecoder(req.Body)
+	defer req.Body.Close()
+	reqbody := struct {
+		Body   string    `json:"body"`
+		UserId uuid.UUID `json:"user_id"`
+	}{}
+	err := decoder.Decode(&reqbody)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	if len(reqbody.Body) > 140 {
+		responsewitherror(w, 400, "Chirp is too long")
+		return
+	} else {
+		cleantext := profanitycheck(reqbody.Body)
+		params := database.CreateChirpParams{
+			Body:   cleantext,
+			UserID: reqbody.UserId,
+		}
+		chirp, err := c.db.CreateChirp(req.Context(), params)
+		if err != nil {
+			responseunknownerror(w)
+			return
+		}
+		resmessage := mapchirp(chirp)
+		marshaled, err := json.Marshal(resmessage)
+		if err != nil {
+			responseunknownerror(w)
+		}
+		w.WriteHeader(201)
+		responsewithjson(w, marshaled)
+		return
+	}
+}
+
+func (c *apiConfig) getchirps(w http.ResponseWriter, req *http.Request) {
+	chirps, err := c.db.GetAllChirps(req.Context())
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	allchirps := []Chirp{}
+	for _, v := range chirps {
+		allchirps = append(allchirps, mapchirp(v))
+	}
+	marshaled, err := json.Marshal(allchirps)
+	if err != nil {
+		responseunknownerror(w)
+	}
+	w.WriteHeader(200)
+	responsewithjson(w, marshaled)
+	return
+}
+
+func (c *apiConfig) getchirp(w http.ResponseWriter, req *http.Request) {
+	id := req.PathValue("chirpID")
+	uifordb, err := uuid.Parse(id)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	dbchirp, err := c.db.GetChirp(req.Context(), uifordb)
+	if err != nil {
+		responsewitherror(w, 404, "Error not found")
+		return
+	}
+	chirp := mapchirp(dbchirp)
+	marshaled, err := json.Marshal(chirp)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	w.WriteHeader(200)
+	responsewithjson(w, marshaled)
+}
+
+func (c *apiConfig) login(w http.ResponseWriter, req *http.Request) {
+	decoder := json.NewDecoder(req.Body)
+	defer req.Body.Close()
+	var userdata ParseUser
+	err := decoder.Decode(&userdata)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	dbuser, err := c.db.GetUserByEmail(req.Context(), userdata.Email)
+	if err != nil {
+		responsewitherror(w, 401, "Incorrect email or password")
+		return
+	}
+	if err := auth.CheckPasswordHash(dbuser.HashedPassword, userdata.Password); err != nil {
+		responsewitherror(w, 401, "Incorrect email or password")
+		return
+	}
+	returnvalue := mapuser(dbuser)
+	data, err := json.Marshal(returnvalue)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	responsewithjson(w, data)
+}
+
+func mapuser(b database.User) ReturnUser {
+	return ReturnUser{
+		ID:        b.ID,
+		CreatedAt: b.CreatedAt,
+		UpdatedAt: b.UpdatedAt,
+		Email:     b.Email,
+	}
+}
+
+func mapchirp(b database.Chirp) Chirp {
+	return Chirp{
+		ID:        b.ID,
+		CreatedAt: b.CreatedAt,
+		UpdatedAt: b.UpdatedAt,
+		Body:      b.Body,
+		UserId:    b.UserID,
+	}
 }
 
 func nicemessage() {
@@ -69,34 +277,6 @@ func nicemessage() {
 			dot = dot + "."
 		}
 		time.Sleep(time.Millisecond * 500)
-	}
-}
-
-func validateChirp(w http.ResponseWriter, req *http.Request) {
-	decoder := json.NewDecoder(req.Body)
-	defer req.Body.Close()
-	reqbody := struct {
-		Body string `json:"body"`
-	}{}
-	err := decoder.Decode(&reqbody)
-	if err != nil {
-		responseunknownerror(w)
-		return
-	}
-	if len(reqbody.Body) > 140 {
-		responsewitherror(w, 400, "Chirp is too long")
-		return
-	} else {
-		cleantext := profanitycheck(reqbody.Body)
-		resmessage, err := json.Marshal(struct {
-			Cleanedbody string `json:"cleaned_body"`
-		}{Cleanedbody: cleantext})
-		if err != nil {
-			responseunknownerror(w)
-			return
-		}
-		responsewithjson(w, resmessage)
-		return
 	}
 }
 
