@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -21,6 +22,7 @@ type apiConfig struct {
 	fileserverhits atomic.Int32
 	db             *database.Queries
 	platform       string
+	secret         string
 }
 
 type ParseUser struct {
@@ -29,13 +31,16 @@ type ParseUser struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
 	Password  string    `json:"password"`
+	ExpiresIn int       `json:"expires_in_seconds"`
 }
 
 type ReturnUser struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
 }
 
 type Chirp struct {
@@ -51,6 +56,7 @@ func main() {
 	godotenv.Load(".env")
 	dbUrl := os.Getenv("DB_URL")
 	apiconf.platform = os.Getenv("PLATFORM")
+	apiconf.secret = os.Getenv("SECRET")
 	db, err := sql.Open("postgres", dbUrl)
 	if err != nil {
 		log.Printf("%v", err)
@@ -66,7 +72,10 @@ func main() {
 	mux.HandleFunc("GET /admin/metrics", apiconf.Counter)
 	mux.HandleFunc("POST /admin/reset", apiconf.Reset)
 	mux.HandleFunc("POST /api/users", apiconf.createUser)
+	mux.HandleFunc("PUT /api/users", apiconf.updateuser)
 	mux.HandleFunc("POST /api/login", apiconf.login)
+	mux.HandleFunc("POST /api/refresh", apiconf.refreshtoken)
+	mux.HandleFunc("POST /api/revoke", apiconf.revoketoken)
 	mux.HandleFunc("POST /api/chirps", apiconf.validateChirp)
 	mux.HandleFunc("GET /api/chirps", apiconf.getchirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiconf.getchirp)
@@ -144,12 +153,21 @@ func (c *apiConfig) validateChirp(w http.ResponseWriter, req *http.Request) {
 	decoder := json.NewDecoder(req.Body)
 	defer req.Body.Close()
 	reqbody := struct {
-		Body   string    `json:"body"`
-		UserId uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
 	}{}
 	err := decoder.Decode(&reqbody)
 	if err != nil {
 		responseunknownerror(w)
+		return
+	}
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		responsewitherror(w, 401, "Unauthorized")
+		return
+	}
+	id, err := auth.ValidateJWT(token, c.secret)
+	if err != nil {
+		responsewitherror(w, 401, "Unauthorized")
 		return
 	}
 	if len(reqbody.Body) > 140 {
@@ -159,7 +177,7 @@ func (c *apiConfig) validateChirp(w http.ResponseWriter, req *http.Request) {
 		cleantext := profanitycheck(reqbody.Body)
 		params := database.CreateChirpParams{
 			Body:   cleantext,
-			UserID: reqbody.UserId,
+			UserID: id,
 		}
 		chirp, err := c.db.CreateChirp(req.Context(), params)
 		if err != nil {
@@ -236,8 +254,128 @@ func (c *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 		responsewitherror(w, 401, "Incorrect email or password")
 		return
 	}
+	token, err := c.CreateTokenForUser(dbuser.ID)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	refreshtoken, err := c.createrefreshtoken(dbuser.ID)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
 	returnvalue := mapuser(dbuser)
+	returnvalue.Token = token
+	returnvalue.RefreshToken = refreshtoken.Token
 	data, err := json.Marshal(returnvalue)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	responsewithjson(w, data)
+}
+
+func (c *apiConfig) refreshtoken(w http.ResponseWriter, req *http.Request) {
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		responsewitherror(w, 401, "Unauthorized")
+		return
+	}
+	tokendata, err := c.db.GetRefreshByToken(req.Context(), token)
+	if err != nil {
+		responsewitherror(w, 401, "Unauthorized")
+		return
+	}
+	if tokendata.RevokedAt.Valid == true {
+		responsewitherror(w, 401, "Unauthorized")
+		return
+	}
+	user, err := c.db.GetUserByRefreshToken(req.Context(), token)
+	if err != nil {
+		responsewitherror(w, 405, "error here")
+		return
+	}
+	newtoken, err := c.CreateTokenForUser(user.ID)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	var returnstruct struct {
+		Token string `json:"token"`
+	}
+	returnstruct.Token = newtoken
+	data, err := json.Marshal(returnstruct)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	responsewithjson(w, data)
+}
+
+func (c *apiConfig) createrefreshtoken(id uuid.UUID) (database.RefreshToken, error) {
+	refreshtoken, _ := auth.MakeRefreshToken()
+	params := database.CreateRefreshTokenParams{
+		Token:     refreshtoken,
+		UserID:    uuid.NullUUID{UUID: id, Valid: true},
+		ExpiresAt: time.Now().Add(time.Hour * 1440),
+	}
+	token, err := c.db.CreateRefreshToken(context.Background(), params)
+	return token, err
+}
+
+func (c *apiConfig) revoketoken(w http.ResponseWriter, req *http.Request) {
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		responsewitherror(w, 404, "Not found")
+		return
+	}
+	params := database.RevokeTokenParams{
+		Token:     token,
+		RevokedAt: sql.NullTime{Time: time.Now(), Valid: true},
+	}
+	err = c.db.RevokeToken(req.Context(), params)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	w.WriteHeader(204)
+}
+
+func (c *apiConfig) updateuser(w http.ResponseWriter, req *http.Request) {
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		responsewitherror(w, 401, "Unauthorized")
+		return
+	}
+	id, err := auth.ValidateJWT(token, c.secret)
+	if err != nil {
+		responsewitherror(w, 401, "Unauthorized")
+		return
+	}
+	decoder := json.NewDecoder(req.Body)
+	var user ParseUser
+	err = decoder.Decode(&user)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	hashed, err := auth.HashPassword(user.Password)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	params := database.UpdateUserCredentialsParams{
+		Email:          user.Email,
+		HashedPassword: hashed,
+		ID:             id,
+	}
+	almostreturnuser, err := c.db.UpdateUserCredentials(req.Context(), params)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	returnuser := mapuser(almostreturnuser)
+	data, err := json.Marshal(returnuser)
 	if err != nil {
 		responseunknownerror(w)
 		return
@@ -262,6 +400,10 @@ func mapchirp(b database.Chirp) Chirp {
 		Body:      b.Body,
 		UserId:    b.UserID,
 	}
+}
+
+func (c *apiConfig) CreateTokenForUser(id uuid.UUID) (string, error) {
+	return auth.MakeJWT(id, c.secret, time.Duration(4800)*time.Second)
 }
 
 func nicemessage() {
