@@ -25,6 +25,13 @@ type apiConfig struct {
 	secret         string
 }
 
+type WebHook struct {
+	Event string `json:"event"`
+	Data  struct {
+		UserID uuid.UUID `json:"user_id"`
+	} `json:"data"`
+}
+
 type ParseUser struct {
 	ID        uuid.UUID `json:"id"`
 	CreatedAt time.Time `json:"created_at"`
@@ -41,6 +48,7 @@ type ReturnUser struct {
 	Email        string    `json:"email"`
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 }
 
 type Chirp struct {
@@ -79,6 +87,8 @@ func main() {
 	mux.HandleFunc("POST /api/chirps", apiconf.validateChirp)
 	mux.HandleFunc("GET /api/chirps", apiconf.getchirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiconf.getchirp)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiconf.deletechirp)
+	mux.HandleFunc("POST /api/polka/webhooks", apiconf.upgradeuser)
 	server := &http.Server{
 		Addr:    ":" + port,
 		Handler: mux,
@@ -218,7 +228,7 @@ func (c *apiConfig) getchirp(w http.ResponseWriter, req *http.Request) {
 	id := req.PathValue("chirpID")
 	uifordb, err := uuid.Parse(id)
 	if err != nil {
-		responseunknownerror(w)
+		responsewitherror(w, 401, "Wrong id")
 		return
 	}
 	dbchirp, err := c.db.GetChirp(req.Context(), uifordb)
@@ -234,6 +244,41 @@ func (c *apiConfig) getchirp(w http.ResponseWriter, req *http.Request) {
 	}
 	w.WriteHeader(200)
 	responsewithjson(w, marshaled)
+}
+
+func (c *apiConfig) deletechirp(w http.ResponseWriter, req *http.Request) {
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		responsewitherror(w, 401, "Unauthorized")
+		return
+	}
+	userid, err := auth.ValidateJWT(token, c.secret)
+	if err != nil {
+		responsewitherror(w, 403, "Forbidden")
+		return
+	}
+	id := req.PathValue("chirpID")
+	idfordb, err := uuid.Parse(id)
+	if err != nil {
+		responsewitherror(w, 401, "Unauthorized")
+		return
+	}
+	chirp, err := c.db.GetChirp(req.Context(), idfordb)
+	if err != nil {
+		responsewitherror(w, 404, "Not found")
+	}
+	if chirp.UserID != userid {
+		responsewitherror(w, 403, "Forbidden")
+	}
+	params := database.DeleteChirpParams{
+		ID:     idfordb,
+		UserID: userid,
+	}
+	if err := c.db.DeleteChirp(req.Context(), params); err != nil {
+		responsewitherror(w, 404, "Chirp not found.")
+		return
+	}
+	w.WriteHeader(204)
 }
 
 func (c *apiConfig) login(w http.ResponseWriter, req *http.Request) {
@@ -383,12 +428,34 @@ func (c *apiConfig) updateuser(w http.ResponseWriter, req *http.Request) {
 	responsewithjson(w, data)
 }
 
+func (c *apiConfig) upgradeuser(w http.ResponseWriter, req *http.Request) {
+	decoder := json.NewDecoder(req.Body)
+	defer req.Body.Close()
+	var webhook WebHook
+	err := decoder.Decode(&webhook)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	if webhook.Event != "user.upgraded" {
+		w.WriteHeader(204)
+		return
+	}
+	err = c.db.UpgradeUser(req.Context(), webhook.Data.UserID)
+	if err != nil {
+		responseunknownerror(w)
+		return
+	}
+	w.WriteHeader(204)
+}
+
 func mapuser(b database.User) ReturnUser {
 	return ReturnUser{
-		ID:        b.ID,
-		CreatedAt: b.CreatedAt,
-		UpdatedAt: b.UpdatedAt,
-		Email:     b.Email,
+		ID:          b.ID,
+		CreatedAt:   b.CreatedAt,
+		UpdatedAt:   b.UpdatedAt,
+		Email:       b.Email,
+		IsChirpyRed: b.IsChirpyRed,
 	}
 }
 
