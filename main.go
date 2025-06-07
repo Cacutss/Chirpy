@@ -23,6 +23,7 @@ type apiConfig struct {
 	db             *database.Queries
 	platform       string
 	secret         string
+	polkakey       string
 }
 
 type WebHook struct {
@@ -65,6 +66,7 @@ func main() {
 	dbUrl := os.Getenv("DB_URL")
 	apiconf.platform = os.Getenv("PLATFORM")
 	apiconf.secret = os.Getenv("SECRET")
+	apiconf.polkakey = os.Getenv("POLKA_KEY")
 	db, err := sql.Open("postgres", dbUrl)
 	if err != nil {
 		log.Printf("%v", err)
@@ -429,10 +431,19 @@ func (c *apiConfig) updateuser(w http.ResponseWriter, req *http.Request) {
 }
 
 func (c *apiConfig) upgradeuser(w http.ResponseWriter, req *http.Request) {
+	apikey, err := auth.GetAPIKey(req.Header)
+	if err != nil {
+		responsewitherror(w, 401, "Unauthorized")
+		return
+	}
+	if apikey != c.polkakey {
+		responsewitherror(w, 401, "Unauthorized")
+		return
+	}
 	decoder := json.NewDecoder(req.Body)
 	defer req.Body.Close()
 	var webhook WebHook
-	err := decoder.Decode(&webhook)
+	err = decoder.Decode(&webhook)
 	if err != nil {
 		responseunknownerror(w)
 		return
