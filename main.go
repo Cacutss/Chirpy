@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -208,16 +209,35 @@ func (c *apiConfig) validateChirp(w http.ResponseWriter, req *http.Request) {
 }
 
 func (c *apiConfig) getchirps(w http.ResponseWriter, req *http.Request) {
-	chirps, err := c.db.GetAllChirps(req.Context())
+	author, err := uuid.Parse(req.URL.Query().Get("author_id"))
+	sorting := req.URL.Query().Get("sort")
+	var marshaled []byte
+	var allchirps []Chirp
 	if err != nil {
-		responseunknownerror(w)
-		return
+		chirps, err := c.db.GetAllChirps(req.Context())
+		if err != nil {
+			responseunknownerror(w)
+			return
+		}
+		for _, v := range chirps {
+			allchirps = append(allchirps, mapchirp(v))
+		}
+	} else {
+		chirps, err := c.db.GetAuthorChirps(req.Context(), author)
+		if err != nil {
+			responseunknownerror(w)
+			return
+		}
+		for _, v := range chirps {
+			allchirps = append(allchirps, mapchirp(v))
+		}
 	}
-	allchirps := []Chirp{}
-	for _, v := range chirps {
-		allchirps = append(allchirps, mapchirp(v))
+	if sorting == "desc" {
+		sort.Slice(allchirps, func(i, j int) bool {
+			return allchirps[i].CreatedAt.After(allchirps[j].CreatedAt)
+		})
 	}
-	marshaled, err := json.Marshal(allchirps)
+	marshaled, err = json.Marshal(allchirps)
 	if err != nil {
 		responseunknownerror(w)
 	}
